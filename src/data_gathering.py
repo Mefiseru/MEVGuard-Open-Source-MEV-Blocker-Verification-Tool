@@ -1,7 +1,7 @@
 import os
 import json
 import time
-from utils import setup_logging, log
+from utils import setup_logging, log, log_error
 from web3 import Web3
 from web3.datastructures import AttributeDict
 from dune_client.client import DuneClient
@@ -11,6 +11,11 @@ from dune_client.types import QueryParameter
 from dotenv import load_dotenv
 from multiprocessing import Pool, cpu_count
 import yaml
+import requests
+
+from bundle_simulation import greedy_bundle_selection, simulate_bundles, store_simulation_results
+from state_management import initialize_web3, simulate_transaction_bundle, update_block_state, verify_transaction_inclusion 
+
 
 # Load environment variables
 dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
@@ -25,10 +30,12 @@ with open(config_path, 'r') as file:
 data_dir = config['data_storage']['data_directory']
 logs_dir = config['data_storage']['logs_directory']
 log_filename = config['data_storage']['log_filename']
+simulation_results_dir = config['data_storage']['simulation_output_directory']
 
 # Ensure data and logs directories exist
 os.makedirs(data_dir, exist_ok=True)
 os.makedirs(logs_dir, exist_ok=True)
+os.makedirs(simulation_results_dir, exist_ok=True)
 
 # Load SQL queries from files
 backrun_query_path = os.path.join(os.path.dirname(__file__), '..', 'queries', 'fetch_backruns.sql')
@@ -45,8 +52,11 @@ dune_api_key = os.getenv('DUNE_API_KEY')
 web3 = Web3(Web3.HTTPProvider(rpc_node_url))
 dune_client = DuneClient(api_key=dune_api_key)
 
-# Load query ID's
+# Load query ID
 all_mev_blocker_bundle_per_block = config['all_mev_blocker_bundle_per_block']  # Updated to use config.yaml
+
+# List to keep track of retried blocks
+retried_blocks = []
 
 def convert_to_dict(obj):
     """Convert AttributeDict or bytes objects into serializable dictionaries."""
@@ -63,10 +73,37 @@ def convert_to_dict(obj):
         return str(obj)  # Fallback to string representation if any error occurs
 
 def fetch_block_contents(block_number):
-    """Fetch the contents of a block given its number."""
-    block = web3.eth.get_block(block_number, full_transactions=True)
-    log(f"Fetched block {block_number} with {len(block['transactions'])} transactions.")
-    return block
+    """Fetch the contents of a block given its number, with optional retry logic for rate-limiting."""
+    retries = config['rate_limit_handling']['max_retries']
+    delay = config['rate_limit_handling']['initial_delay_seconds']
+    exponential_backoff = config['rate_limit_handling']['exponential_backoff']
+    enable_retry = config['rate_limit_handling'].get('enable_retry', True)  # Default to True if not set
+
+    for attempt in range(retries if enable_retry else 1):  # No retries if retry is disabled
+        try:
+            block = web3.eth.get_block(block_number, full_transactions=True)
+            return block
+        except requests.exceptions.HTTPError as err:
+            if err.response.status_code == 429:  # Too Many Requests
+                if enable_retry:
+                    log(f"Rate limit exceeded for block {block_number}, retrying after {delay} seconds... (Attempt {attempt+1}/{retries})")
+                    time.sleep(delay)
+                    if exponential_backoff:
+                        delay *= 2  # Exponential backoff if enabled
+                    # Add the block number to the retried blocks list
+                    if block_number not in retried_blocks:  # Avoid duplicates
+                        retried_blocks.append(block_number)
+                        log(f"Added block {block_number} to retried blocks list.")  # Log as soon as added
+                        log(f"Current retried blocks: {', '.join(map(str, retried_blocks))}")  # Dynamic list logging
+                else:
+                    log(f"Rate limit exceeded for block {block_number}. Skipping retries.")
+                    break
+            else:
+                log(f"Failed to process block {block_number}: {err}")
+                raise
+    log(f"Exceeded retry limit for block {block_number}.")
+    return None
+
 
 def log_discrepancy_and_abort(message):
     """Log an error message and abort the script."""
@@ -162,8 +199,77 @@ def get_latest_processed_block():
     latest_block = int(latest_file.split('_')[1].split('.')[0])
     return latest_block
 
+def get_simulated_blocks():
+    """
+    Check the simulation results directory to find blocks that have already been simulated.
+    :return: A list of block numbers that have already been simulated
+    """
+    simulated_files = [f for f in os.listdir(simulation_results_dir) if f.endswith('.json')]
+    simulated_blocks = [int(f.split('_')[1].split('.')[0]) for f in simulated_files]
+    return simulated_blocks
+
+def load_existing_block_and_bundles(block_number):
+    """
+    Load the block and bundles from the data folder.
+    :param block_number: The block number to load
+    :return: Block data and bundles data
+    """
+    block_file = os.path.join(data_dir, f"block_{block_number}.json")
+    bundles_file = os.path.join(data_dir, f"bundles_{block_number}.json")
+
+    with open(block_file, 'r') as block_f:
+        block_data = json.load(block_f)
+
+    with open(bundles_file, 'r') as bundles_f:
+        bundles_data = json.load(bundles_f)
+
+    return block_data, bundles_data
+
+def simulate_unprocessed_blocks():
+    """
+    Simulate all unprocessed (unsimulated) blocks by looking into the `data` directory.
+    """
+    # List all blocks saved in the data directory
+    all_blocks = [int(f.split('_')[1].split('.')[0]) for f in os.listdir(data_dir) if f.startswith('block_')]
+    
+    # Get the blocks that have already been simulated
+    simulated_blocks = get_simulated_blocks()
+
+    # Filter out the blocks that have already been simulated
+    unprocessed_blocks = [block for block in all_blocks if block not in simulated_blocks]
+
+    if not unprocessed_blocks:
+        log("No new blocks to simulate.")
+        return
+
+    for block_number in unprocessed_blocks:
+        log(f"Processing block {block_number}...")
+
+        try:
+            block_data, bundles_data = load_existing_block_and_bundles(block_number)
+
+            if bundles_data:
+                # Apply greedy algorithm to select the best bundles
+                max_selected_bundles = config['bundle_simulation']['max_selected_bundles']
+
+                selected_bundles = greedy_bundle_selection(bundles_data, max_selected_bundles)
+
+                # Simulate the selected bundles
+                log(f"Simulating bundles for block {block_number}...")
+                simulation_results = simulate_bundles(selected_bundles, web3, block_number)
+
+                # Store the simulation results
+                simulation_output_file = os.path.join(simulation_results_dir, f"simulation_{block_number}.json")
+                log(f"Storing the simulation results for block {block_number}...")
+                store_simulation_results(simulation_results, simulation_output_file)
+
+        except Exception as e:
+            log(f"Error while processing block {block_number}: {e}")
+
 def get_mev_blocker_bundles():
-    """Prepare and execute Dune Analytics query to get MEV Blocker bundles."""
+    """
+    Prepare and execute Dune Analytics query to get MEV Blocker bundles.
+    """
     # Compare and validate the SQL
     if not compare_and_validate_sql(all_mev_blocker_bundle_per_block, local_backrun_query_sql):
         return None
@@ -188,31 +294,66 @@ def get_mev_blocker_bundles():
     return execute_query_and_get_results(all_mev_blocker_bundle_per_block, start_block, end_block)
 
 def store_data(block, bundles):
-    """Store the block and bundles data into the data directory."""
+    """
+    Store the block and bundles data into the data directory after converting all transactions to dictionary format.
+    """
     # Convert block to dictionary
     block_dict = convert_to_dict(block)
 
+    # Ensure that each transaction within bundles is a properly parsed JSON dictionary
+    for bundle in bundles:
+        if isinstance(bundle['transactions'], str):
+            try:
+                bundle['transactions'] = json.loads(bundle['transactions'])  # Parse transactions string into JSON
+            except json.JSONDecodeError as e:
+                log(f"Error decoding transactions for bundle: {bundle}. Error: {e}")
+                continue  # Skip this bundle if parsing fails
+
+    # Save block data
     with open(os.path.join(data_dir, f"block_{block['number']}.json"), 'w') as f:
         json.dump(block_dict, f, indent=4)
 
+    # Save bundles data
     with open(os.path.join(data_dir, f"bundles_{block['number']}.json"), 'w') as f:
         json.dump(bundles, f, indent=4)
 
     log(f"Stored data for block {block['number']}")
 
+
 def process_block(block_number, bundles):
-    """Process a single block: fetch, identify bundles, and store data."""
+    """
+    Process a single block: fetch, simulate, validate, and store data.
+    """
     try:
-        block = fetch_block_contents(block_number)
-        # Here we use the bundles fetched previously
-        store_data(block, bundles)
+        # Load block data and extract block_time
+        block_data, bundles_data = load_existing_block_and_bundles(block_number)
+        block_time = block_data['timestamp']  # Extract block timestamp
+        
+        log(f"Processing block {block_number}...")
+        
+        # Simulate bundles and store results
+        simulation_results = simulate_bundles(bundles, web3, block_number, block_time)
+        simulation_output_file = os.path.join(simulation_results_dir, f"simulation_{block_number}.json")
+        store_simulation_results(simulation_results, simulation_output_file)
+
+        # Verify transaction inclusion
+        for bundle in bundles:
+            for tx in bundle['transactions']:
+                tx_hash = tx.get('hash')
+                if tx_hash:
+                    included = verify_transaction_inclusion(web3, block_number, tx_hash)
+                    if not included:
+                        log_error(f"Transaction {tx_hash} not included in block {block_number}")
+                else:
+                    log_error(f"Missing transaction hash in block {block_number}")
+
     except Exception as e:
-        log(f"Failed to process block {block_number}: {e}")
+        log_error(f"Error while processing block {block_number}: {e}")
+
 
 if __name__ == "__main__":
-    # Initialize logging with the log file from config.yaml
-    log_path = os.path.join(logs_dir, log_filename)
-    setup_logging(log_path)
+    # Initialize logging
+    setup_logging()
 
     log("Starting data gathering process...")
 
@@ -242,8 +383,39 @@ if __name__ == "__main__":
         # Gather a specified number of blocks (e.g., 5)
         block_numbers = [latest_processed_block - i for i in range(num_blocks_to_process)]
 
-    # Use multiprocessing to handle multiple blocks concurrently
-    with Pool(processes=cpu_count()) as pool:
-        pool.starmap(process_block, [(block_number, bundles) for block_number in block_numbers])
+    # Store block data and bundles before further processing
+    log("Fetching and storing block data and bundles...")
+    for block_number in block_numbers:
+        try:
+            block_data = web3.eth.get_block(block_number, full_transactions=True)
+            log(f"Fetched block data for block {block_number} with {len(block_data['transactions'])} transactions.")
 
-    log("All blocks processed.")
+            # Store block data and bundles
+            store_data(block_data, bundles)
+            log(f"Stored block data and bundles for block {block_number}.")
+
+        except Exception as e:
+            log_error(f"Error fetching or storing block data for block {block_number}: {e}")
+            continue
+
+    # Greedy algorithm to select the best bundles
+    max_selected_bundles = config['bundle_simulation']['max_selected_bundles']
+    log(f"Selecting the best {max_selected_bundles} bundles using the greedy algorithm...")
+
+    selected_bundles = greedy_bundle_selection(bundles, max_selected_bundles)
+
+    # Check if simulation is enabled
+    simulation_enabled = config['bundle_simulation']['simulation_enabled']
+    if simulation_enabled:
+        log("Simulating the selected bundles...")
+
+        # Ensure block time is passed to simulation
+        block_time = block_data.get('timestamp')  # Correctly fetch block time
+        simulation_results = simulate_bundles(selected_bundles, web3, latest_block_number, block_time)
+
+        # Store the simulation results
+        simulation_output_file = os.path.join(data_dir, config['bundle_simulation']['simulation_output_file'])
+        log(f"Storing the simulation results to {simulation_output_file}...")
+        store_simulation_results(simulation_results, simulation_output_file)
+
+    log("All tasks for this phase completed successfully.")
